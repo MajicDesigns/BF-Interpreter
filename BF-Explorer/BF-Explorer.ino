@@ -69,6 +69,7 @@ bool initializeMemory(void)
 
   // reset the current memory address
   addrMP = 0;
+  Serial.print(F("\nMemory cleared."));
 
   return(b);
 }
@@ -195,14 +196,71 @@ void handlerP(char* param)
     runMode = RUN;
 }
 
-void handlerX(char* param)
-// toggle list running program 
+void handlerT(char* param)
+// toggle trace list running program 
 {
   Serial.print(F("listing "));
   listRunning = !listRunning;
   Serial.print(listRunning ? F("on") : F("off"));
   if (runMode == IDLE)
     setIdle();  // only for the prompt ...
+}
+
+char htoa(uint8_t n)
+{
+  char c;
+
+  if (n < 10)
+    c = n + '0';
+  else if (n >= 10 && n <= 15)
+    c = 'a' + n - 10;
+  else
+    c = '?';
+
+  return(c);
+}
+
+void handlerD(char* param)
+{
+  const uint8_t DUMP_SIZE = 8;
+  const uint32_t addr = strtoul(param, nullptr, 0);
+
+  char sz[(DUMP_SIZE*3) + 2 + DUMP_SIZE + 1];
+  uint8_t pos = 0;  // position in th string
+  uint8_t m;        // memory cell contents
+
+  Serial.print(F("dump "));
+  Serial.print(addr);
+
+  // clear the buffer
+  memset(sz, ' ', ARRAY_SIZE(sz));
+  sz[ARRAY_SIZE(sz) - 1] = '\0';
+
+  // now make up the formatted output
+  fileMem.seekSet(addr);
+  for (uint8_t i = 0; i < DUMP_SIZE; i++)
+  {
+    m = fileMem.read();
+    sz[pos++] = htoa(m >> 4);
+    sz[pos++] = htoa(m & 0xf);
+    pos++;
+  }
+
+  // now display ASCII equivalents
+  pos += 2;
+  fileMem.seekSet(addr);
+  for (uint8_t i = 0; i < DUMP_SIZE; i++)
+  {
+    m = fileMem.read();
+    sz[pos++] = (m <= 0xa ? '.' : m);
+  }
+
+  // now display the data
+  Serial.print(F("\n"));
+  Serial.print(sz);
+
+  fileMem.seekSet(addrMP);  // reset file position to current mp
+  setIdle();
 }
 
 const MD_cmdProcessor::cmdItem_t PROGMEM cmdTable[] =
@@ -214,8 +272,9 @@ const MD_cmdProcessor::cmdItem_t PROGMEM cmdTable[] =
   { "l",  handlerL,    "file", "load the named file", 2 },
   { "r",  handlerR,    "",     "run the current file from start conditions", 2 },
   { "s",  handlerS,    "n",    "step running program by n steps (default 1)", 2 },
+  { "d",  handlerD,    "n",    "dump memory address n to addr+8", 3 },
   { "p",  handlerP,    "",     "toggle pause program", 3 },
-  { "x",  handlerX,    "",     "toggle executing listing", 3 },
+  { "t",  handlerT,    "",     "toggle execution trace listing", 3 },
 };
 
 MD_cmdProcessor CP(Serial, cmdTable, ARRAY_SIZE(cmdTable));
