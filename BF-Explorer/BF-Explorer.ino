@@ -44,11 +44,99 @@ const uint8_t SD_SELECT = 10;             // SD chip select pin for SPI comms
 const char MEM_FILENAME[] = "MEMORY.DAT"; // memory file name
 const int32_t MEMORY_SIZE = 30000;       // size of the BF memory in bytes
 
+class cVirtualMemory
+{
+public:
+  cVirtualMemory(uint16_t pageSize):
+    _pageData(nullptr), _pageSize(pageSize)
+  {}
+
+  ~cVirtualMemory()
+  {
+    free(_pageData);
+  }
+
+  bool isLoaded(void) { return(_fp.isOpen()); }
+  bool isInBounds(uint32_t addr) { return (addr <= _fileSize); }
+
+  bool begin(const char* fname)
+  {
+    if (_fp.isOpen())
+      _fp.close();
+
+    if (_pageData == nullptr)     // allocate the memory required
+      _pageData = (uint8_t*)malloc(_pageSize * sizeof(uint8_t));
+
+    if (_pageData != nullptr)  // open file and load first page
+    {
+      _fp.open(fname, O_RDWR);
+      _fileSize = _fp.fileSize();
+      loadPage(0);
+    }
+
+    return(_pageData != nullptr && _fp.isOpen());
+  }
+
+  uint8_t get(uint32_t addr)
+  {
+    if (addr < _pageBaseAddr || addr >= _pageBaseAddr + _pageSize)
+    {
+      // save the page if it has changed
+      savePage(_pageBaseAddr);
+
+      // load the new page
+      _pageBaseAddr = (addr / _pageSize) * _pageSize; 
+      loadPage(_pageBaseAddr);
+    }
+
+    return(_pageData[addr - _pageBaseAddr]);
+  }
+
+  void set(uint32_t addr, uint8_t value)
+  {
+    if (addr < _pageBaseAddr || addr >= _pageBaseAddr + _pageSize)
+    {
+      // save the page if it has changed
+      savePage(_pageBaseAddr);
+
+      // load the new page
+      _pageBaseAddr = (addr / _pageSize) * _pageSize;
+      loadPage(_pageBaseAddr);
+    }
+
+    _pageData[addr - _pageBaseAddr] = value;
+    _pageChanged = true;
+  }
+
+private:
+  SdFile _fp;    // actual swap file swap file
+  uint32_t _fileSize;     // size of the file
+  uint8_t* _pageData;
+  uint32_t _pageBaseAddr;
+  uint16_t _pageSize;
+  bool _pageChanged;
+
+  void loadPage(uint32_t addr)
+  {
+    _fp.seekSet(addr);
+    _fp.read(_pageData, _pageSize);
+    _pageBaseAddr = addr;
+    _pageChanged = false;
+  }
+
+  void savePage(uint32_t addr)
+  {
+    if (_pageChanged)
+    {
+      _fp.seekSet(addr);
+      _fp.write(_pageData, _pageSize);
+    }
+  }
+};
+
 // Global Data
 SdFat SD;
-
-SdFile fileProg;    // program file descriptor
-SdFile fileMem;     // memory file descriptor
+cVirtualMemory program(200), memory(100);
 
 int32_t addrIP, addrMP;   // current program and memory address
 bool listRunning = false; // flag for listing the running program
@@ -56,32 +144,25 @@ bool listRunning = false; // flag for listing the running program
 enum { IDLE, RUN, STEP } runMode = IDLE;
 uint16_t steps;   // keeps the number of streps to run
 
-bool initializeMemory(void)
-// initialise an open memory file with zeroes
+void clearMemory(void)
+// create and initialize the memory data
 {
-  bool b = true;
-
-  fileMem.rewind();   // back to start
   for (uint32_t i = 0; i < MEMORY_SIZE; i++)
-    fileMem.write((uint8_t)0);
-  fileMem.flush();
-  fileMem.rewind();   // move back to the start
-
-  // reset the current memory address
-  addrMP = 0;
+    memory.set(i, 0);
   Serial.print(F("\nMemory cleared."));
-
-  return(b);
 }
 
 bool createMemory(void)
-// create a new memory file
+// create and initialise the memory file
 {
-  bool b = true;
+ bool b = true;
+ SdFile fp;
 
-  if (fileMem.open(MEM_FILENAME, O_RDWR | O_CREAT))
+  if (fp.open(MEM_FILENAME, O_RDWR | O_CREAT))
   {
-    b = initializeMemory();
+    for (uint32_t i = 0; i < MEMORY_SIZE; i++)
+      fp.write((uint8_t)0);
+    fp.close();
   }
   else
   {
@@ -150,12 +231,12 @@ void handlerL(char* param)
   Serial.print(F("'"));
   if (runMode == IDLE)
   {
-    // if a file is already open, close it
-    if (fileProg.isOpen())
-      fileProg.close();
-
-    // open the program file
-    if (!fileProg.open(param, O_RDONLY))
+    if (program.begin(param))
+    {
+      clearMemory();
+      addrMP = addrIP = 0;   // start at the first address
+    }
+    else
       Serial.print(F("\n!File not found"));
   }
   setIdle();
@@ -164,26 +245,20 @@ void handlerL(char* param)
 void handlerR(char* param)
 // run the currently loaded program
 {
-  Serial.print(F("run"));
   if (runMode == IDLE)
   {
+    Serial.print(F("run"));
+
     // file needs to be open
-    if (!fileProg.isOpen())
+    if (!program.isLoaded())
     {
       Serial.print(F("!No program loaded"));
       return;
     }
 
-    // if mem initialize successful, set up for run
-    if (initializeMemory())
-    {
-      fileProg.rewind();
-      addrIP = 0;   // start at the first address
-      runMode = RUN;
-      Serial.print(F("\n"));    // clean line for any output from the program
-    }
-    else  // can't init memory
-      setIdle();
+    // set up for run
+    runMode = RUN;
+    Serial.print(F("\n"));    // clean line for any output from the program
   }
 }
 
@@ -199,7 +274,7 @@ void handlerP(char* param)
 void handlerT(char* param)
 // toggle trace list running program 
 {
-  Serial.print(F("listing "));
+  Serial.print(F("trace "));
   listRunning = !listRunning;
   Serial.print(listRunning ? F("on") : F("off"));
   if (runMode == IDLE)
@@ -237,10 +312,9 @@ void handlerD(char* param)
   sz[ARRAY_SIZE(sz) - 1] = '\0';
 
   // now make up the formatted output
-  fileMem.seekSet(addr);
   for (uint8_t i = 0; i < DUMP_SIZE; i++)
   {
-    m = fileMem.read();
+    m = memory.get(addr + 1);
     sz[pos++] = htoa(m >> 4);
     sz[pos++] = htoa(m & 0xf);
     pos++;
@@ -248,10 +322,9 @@ void handlerD(char* param)
 
   // now display ASCII equivalents
   pos += 2;
-  fileMem.seekSet(addr);
   for (uint8_t i = 0; i < DUMP_SIZE; i++)
   {
-    m = fileMem.read();
+    m = memory.get(addr + 1);
     sz[pos++] = (m <= 0xa ? '.' : m);
   }
 
@@ -259,7 +332,6 @@ void handlerD(char* param)
   Serial.print(F("\n"));
   Serial.print(sz);
 
-  fileMem.seekSet(addrMP);  // reset file position to current mp
   setIdle();
 }
 
@@ -279,7 +351,7 @@ const MD_cmdProcessor::cmdItem_t PROGMEM cmdTable[] =
 
 MD_cmdProcessor CP(Serial, cmdTable, ARRAY_SIZE(cmdTable));
 
-void handlerHelp(char* param) { CP.help(); Serial.print(F("\n")); }
+void handlerHelp(char* param) { CP.help(); setIdle(); }
 
 uint8_t getChar(void)
 // blocking read one character from the serial input
@@ -319,6 +391,7 @@ void setup(void)
   handlerHelp(nullptr);
 
   createMemory();
+  memory.begin(MEM_FILENAME);
   setIdle();
 }
 
@@ -328,10 +401,11 @@ void loop(void)
 
   if (runMode != IDLE)
   {
-    uint8_t mem = fileMem.peek();   // we want to keep the file pointer the same
-    int16_t opcode = fileProg.peek();
+    uint8_t mem = memory.get(addrMP);
+    int16_t opcode = program.get(addrIP);
 
-    if (opcode == -1) setIdle();  // end of file
+    if (!program.isInBounds(addrIP)) // IP adress is not in valid range
+      setIdle();
 
     if (runMode == RUN || runMode == STEP)
     {
@@ -348,10 +422,10 @@ void loop(void)
       {
       case '>': ++addrMP; break;
       case '<': --addrMP; break;
-      case '+': ++mem; fileMem.write(mem); break;
-      case '-': --mem; fileMem.write(mem); break;
+      case '+': ++mem; memory.set(addrMP, mem); break;
+      case '-': --mem; memory.set(addrMP, mem); break;
       case '.': Serial.print((char)mem); break;
-      case ',': mem = getChar(); fileMem.write(mem);
+      case ',': mem = getChar(); memory.set(addrMP, mem);
 
       case '[':
         if (!mem)
@@ -360,14 +434,13 @@ void loop(void)
           while (count)
           {
             ++addrIP;
-            if (addrIP >= MEMORY_SIZE)  // end of file
+            if (!program.isInBounds(addrIP))
             {
-              Serial.print(F("!Memory address exceeded"));
-              setIdle();
-              break;
+              Serial.print(F("!Instruction pointer past end of file"));
+                setIdle();
+                break;
             }
-            fileProg.seekSet(addrIP);
-            opcode = fileProg.peek();
+            opcode = program.get(addrIP);
             if (opcode == '[') ++count;
             if (opcode == ']') --count;
           }
@@ -381,14 +454,13 @@ void loop(void)
           while (count)
           {
             --addrIP;
-            if (addrIP < 0)  // beginning of file
+            if (!program.isInBounds(addrIP))
             {
-              Serial.print(F("!Memory address before start"));
+              Serial.print(F("!Instruction pointer before start"));
               setIdle();
               break;
             }
-            fileProg.seekSet(addrIP);
-            opcode = fileProg.peek();
+            opcode = program.get(addrIP);
             if (opcode == ']') ++count;
             if (opcode == '[') --count;
           }
@@ -396,10 +468,6 @@ void loop(void)
         break;
       }
       ++addrIP;
-
-      // adjust the position in the files to the current offset
-      fileMem.seekSet(addrMP);
-      fileProg.seekSet(addrIP);
 
       // show new data in the memory address
       if (listRunning)
